@@ -131,6 +131,7 @@ States: `queued`, `downloading`, `sending`, `retry_scheduled`, `sent`, `failed`.
 - [TolaAI integration](docs/tolaai-integration.md)
 - [Инструкция интеграции на русском](docs/integration-ru.md)
 - [Рекомендации по VPS/VDS](docs/vps-sizing-ru.md)
+- [Автовосстановление после перегрузки](docs/self-healing-under-load-ru.md)
 - [HTTP API](docs/api.md)
 - [Operations and rollback](docs/operations.md)
 
