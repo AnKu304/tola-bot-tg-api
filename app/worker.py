@@ -1,0 +1,200 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import shutil
+from typing import Any
+
+import httpx
+from redis.asyncio import Redis
+
+from app.config import Settings, get_settings
+from app.downloader import DownloadError, download_to_path
+from app.logging_config import configure_logging
+from app.models import DeliveryState, StoredDelivery
+from app.queue import DeliveryQueue
+from app.telegram_client import TelegramAPIError, TelegramBotAPIClient
+
+logger = logging.getLogger(__name__)
+
+
+def _telegram_file_id(message: dict[str, Any]) -> str | None:
+    if message.get("photo"):
+        photos = message.get("photo")
+        if isinstance(photos, list) and photos:
+            value = photos[-1]
+            if isinstance(value, dict) and value.get("file_id"):
+                return str(value["file_id"])
+    for field in ("document", "video", "audio", "animation"):
+        value = message.get(field)
+        if isinstance(value, dict) and value.get("file_id"):
+            return str(value["file_id"])
+    return None
+
+
+async def process_job(
+    job: StoredDelivery,
+    queue: DeliveryQueue,
+    telegram: TelegramBotAPIClient,
+    settings: Settings,
+    *,
+    download_client: httpx.AsyncClient,
+) -> None:
+    job.attempts += 1
+    job.next_attempt_at = None
+    job.error_code = None
+    job.error_message = None
+    work_dir = settings.delivery_temp_dir / job.id
+    file_path = work_dir / job.request.filename
+    try:
+        if (
+            job.request.expected_size_bytes is not None
+            and job.request.expected_size_bytes > settings.delivery_max_file_bytes
+        ):
+            raise DownloadError(
+                "expected file size exceeds the configured 2000 MB limit",
+                retryable=False,
+                code="file_too_large",
+            )
+
+        job.state = DeliveryState.DOWNLOADING
+        await queue.save(job)
+        download = await download_to_path(
+            str(job.request.source_url),
+            file_path,
+            settings,
+            client=download_client,
+        )
+        job.downloaded_size_bytes = download.size_bytes
+        job.state = DeliveryState.SENDING
+        await queue.save(job)
+        message = await telegram.send_file(
+            job.request,
+            file_path,
+            job.request.mime_type or download.content_type,
+        )
+        job.state = DeliveryState.SENT
+        job.telegram_message_id = (
+            int(message["message_id"]) if message.get("message_id") is not None else None
+        )
+        job.telegram_file_id = _telegram_file_id(message)
+        await queue.save(job)
+        logger.info(
+            "delivery sent job_id=%s chat_id=%s bytes=%s attempts=%s",
+            job.id,
+            job.request.chat_id,
+            job.downloaded_size_bytes,
+            job.attempts,
+        )
+    except (DownloadError, TelegramAPIError) as exc:
+        job.error_code = exc.code
+        job.error_message = str(exc)[:500]
+        if exc.retryable and job.attempts < settings.delivery_max_attempts:
+            retry_after = getattr(exc, "retry_after", None)
+            delay = retry_after or min(
+                settings.delivery_retry_base_seconds * (2 ** (job.attempts - 1)), 300
+            )
+            await queue.schedule_retry(job, delay)
+            logger.warning(
+                "delivery retry scheduled job_id=%s code=%s delay=%s attempt=%s",
+                job.id,
+                exc.code,
+                delay,
+                job.attempts,
+            )
+        else:
+            job.state = DeliveryState.FAILED
+            await queue.save(job)
+            logger.error(
+                "delivery failed job_id=%s code=%s attempts=%s",
+                job.id,
+                exc.code,
+                job.attempts,
+            )
+    except Exception:
+        logger.exception("unexpected delivery failure job_id=%s", job.id)
+        job.error_code = "internal_error"
+        job.error_message = "Unexpected delivery worker error"
+        if job.attempts < settings.delivery_max_attempts:
+            delay = min(settings.delivery_retry_base_seconds * (2 ** (job.attempts - 1)), 300)
+            await queue.schedule_retry(job, delay)
+        else:
+            job.state = DeliveryState.FAILED
+            await queue.save(job)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+async def consume(
+    worker_number: int,
+    queue: DeliveryQueue,
+    telegram: TelegramBotAPIClient,
+    settings: Settings,
+    download_client: httpx.AsyncClient,
+) -> None:
+    while True:
+        await queue.promote_due_retries()
+        job_id = await queue.dequeue()
+        if not job_id:
+            continue
+        job = await queue.get(job_id)
+        if job is None or job.state in {DeliveryState.SENT, DeliveryState.FAILED}:
+            continue
+        logger.info("worker=%s processing job_id=%s", worker_number, job_id)
+        await process_job(
+            job,
+            queue,
+            telegram,
+            settings,
+            download_client=download_client,
+        )
+        await queue.acknowledge(job_id)
+
+
+async def heartbeat(queue: DeliveryQueue, settings: Settings) -> None:
+    interval = max(2, settings.delivery_worker_heartbeat_ttl_seconds // 3)
+    while True:
+        await queue.heartbeat()
+        await asyncio.sleep(interval)
+
+
+async def worker_main() -> None:
+    settings = get_settings()
+    errors = settings.runtime_errors()
+    if errors:
+        raise RuntimeError("; ".join(errors))
+    configure_logging(settings.log_level)
+    settings.delivery_temp_dir.mkdir(parents=True, exist_ok=True)
+    redis = Redis.from_url(settings.redis_url)
+    queue = DeliveryQueue(redis, settings)
+    telegram = TelegramBotAPIClient(settings)
+    download_client = httpx.AsyncClient(
+        follow_redirects=False,
+        timeout=httpx.Timeout(
+            connect=settings.source_connect_timeout_seconds,
+            read=settings.source_read_timeout_seconds,
+            write=30.0,
+            pool=settings.source_connect_timeout_seconds,
+        ),
+    )
+    try:
+        await redis.ping()
+        await telegram.get_me()
+        recovered = await queue.recover_processing()
+        if recovered:
+            logger.warning("recovered unacknowledged deliveries count=%s", recovered)
+        await asyncio.gather(
+            heartbeat(queue, settings),
+            *(
+                consume(index + 1, queue, telegram, settings, download_client)
+                for index in range(settings.delivery_worker_concurrency)
+            ),
+        )
+    finally:
+        await download_client.aclose()
+        await telegram.close()
+        await redis.aclose()
+
+
+if __name__ == "__main__":
+    asyncio.run(worker_main())

@@ -1,0 +1,92 @@
+x-delivery-service: &delivery-service
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file: ${ENV_FILE:-.env}
+  environment:
+    REDIS_URL: redis://redis:6379/0
+    TELEGRAM_BOT_API_URL: http://telegram-bot-api:8081
+    DELIVERY_TEMP_DIR: /var/lib/tola-bot/files
+    TELEGRAM_USE_LOCAL_FILE_URI: "true"
+  volumes:
+    - delivery-files:/var/lib/tola-bot/files
+  networks:
+    tola-telegram:
+      aliases:
+        - tola-telegram-delivery
+  restart: unless-stopped
+
+services:
+  api:
+    <<: *delivery-service
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+    ports:
+      - "127.0.0.1:${DELIVERY_API_PORT:-8080}:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+      telegram-bot-api:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/live', timeout=3)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    <<: *delivery-service
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      telegram-bot-api:
+        condition: service_started
+
+  telegram-bot-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.telegram-bot-api
+      args:
+        TELEGRAM_BOT_API_COMMIT: ${TELEGRAM_BOT_API_COMMIT:-e3e9dd8e5b3d7ab8537cd5a10dc31d5ffa8f82d1}
+    env_file: ${ENV_FILE:-.env}
+    command: ["--local", "--http-port=8081"]
+    working_dir: /var/lib/telegram-bot-api
+    volumes:
+      - telegram-data:/var/lib/telegram-bot-api
+      - delivery-files:/var/lib/tola-bot/files:ro
+    ports:
+      - "127.0.0.1:${TELEGRAM_BOT_API_PORT:-8081}:8081"
+    networks:
+      tola-telegram:
+        aliases:
+          - tola-telegram-bot-api
+    restart: unless-stopped
+
+  redis:
+    image: redis:8.2.1-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis-data:/data
+    networks:
+      - tola-telegram
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+networks:
+  tola-telegram:
+    name: ${TELEGRAM_DOCKER_NETWORK:-tola-telegram}
+
+volumes:
+  delivery-files:
+  redis-data:
+  telegram-data:
