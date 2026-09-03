@@ -45,6 +45,8 @@ class DeliveryRequest(BaseModel):
     @classmethod
     def validate_filename(cls, value: str) -> str:
         cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("filename must not be blank")
         if cleaned != Path(cleaned).name or cleaned in {".", ".."}:
             raise ValueError("filename must not contain a path")
         if re.search(r"[\x00-\x1f\x7f]", cleaned):

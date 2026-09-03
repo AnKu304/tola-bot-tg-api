@@ -35,126 +35,115 @@ The stable service aliases on that network are:
 
 ## 2. Route every Bot instance through the local server
 
-Add settings equivalent to:
+Keep the existing TolaAI `TELEGRAM_API_BASE_URL` setting backward compatible:
+it is a server root **without** `/bot`; the existing factory appends `/bot`.
+Putting `/bot` in the environment creates an invalid doubled path.
 
 ```env
-TELEGRAM_BOT_API_BASE_URL=http://tola-telegram-bot-api:8081/bot
-TELEGRAM_BOT_API_FILE_BASE_URL=http://tola-telegram-bot-api:8081/file/bot
-TELEGRAM_BOT_LOCAL_MODE=true
+TELEGRAM_API_BASE_URL=http://tola-telegram-bot-api:8081
+TELEGRAM_LOCAL_MODE=true
 TELEGRAM_DELIVERY_URL=http://tola-telegram-delivery:8080
 TELEGRAM_DELIVERY_TOKEN=<same value as APP_API_TOKEN in this service>
+TELEGRAM_LARGE_DELIVERY_ENABLED=false
 ```
 
-Create one factory and use it everywhere:
+The shared factory must set `base_url=<root>/bot`,
+`base_file_url=<root>/file/bot`, and `local_mode=true` for both `Bot` and
+`Application`. Inventory all direct constructors and webhook/auth call sites,
+including `backend/core/telegram_setup.py`, `backend/main.py`,
+`backend/core/auth.py`, and `scripts/reset-telegram-webhook.sh`, in addition to
+the bot, generation, payment, referral, broadcast, and menu-refresh modules.
+After `logOut`, no process may use the same token against the cloud endpoint.
+
+## 3. Choose the route before reading S3
+
+TolaAI currently reads the complete object in the generation endpoint. Use
+stored metadata before that call:
+
+- below 50 MiB, retain direct upload only through the configured local server;
+- at 50 MiB and above, enqueue this service;
+- if size is unknown, enqueue this service and rely on its streamed hard limit.
+
+The tested reference is `choose_delivery_route()` in
+`examples/tolaai_client.py`. A queued `TolaFile` provides `mime_type`,
+`size_bytes`, `s3_bucket`, and `s3_key`. Treat `original_name` as untrusted;
+use a deterministic basename unless it has been sanitized separately.
 
 ```python
-from telegram import Bot
-from telegram.ext import Application
-
-
-def bot_kwargs(settings) -> dict:
-    return {
-        "token": settings.telegram_bot_token,
-        "base_url": settings.telegram_bot_api_base_url,
-        "base_file_url": settings.telegram_bot_api_file_base_url,
-        "local_mode": settings.telegram_bot_local_mode,
-    }
-
-
-def build_bot(settings) -> Bot:
-    return Bot(**bot_kwargs(settings))
-
-
-def build_application(settings) -> Application:
-    return (
-        Application.builder()
-        .token(settings.telegram_bot_token)
-        .base_url(settings.telegram_bot_api_base_url)
-        .base_file_url(settings.telegram_bot_api_file_base_url)
-        .local_mode(settings.telegram_bot_local_mode)
-        .updater(None)
-        .build()
-    )
-```
-
-During the audit, direct bot construction was present in these TolaAI files and
-must be replaced by that factory:
-
-- `backend/bot/handlers.py`;
-- `backend/services/referral_service.py`;
-- `backend/tasks/generation_tasks.py`;
-- `backend/scripts/broadcast_security_notice.py`;
-- `backend/scripts/refresh_miniapp_menu_buttons.py`;
-- `backend/api/v1/endpoints/payment.py`;
-- `backend/api/v1/endpoints/generation.py`.
-
-This is mandatory after calling `logOut`: one token must not be used against
-the cloud and local Bot API servers at the same time.
-
-## 3. Enqueue generated files instead of loading them into RAM
-
-TolaAI currently reads the complete S3 object in the generation endpoint.
-Replace only the Telegram delivery branch with a request to this service. Keep
-the browser download/presigned URL behaviour unchanged.
-
-Use the existing `read_url_for_object(...)` helper to create a signed URL that
-remains valid for the queue and retries. Six hours is a reasonable starting
-TTL. Pass the stored `TolaFile.size_bytes` as `expected_size_bytes`.
-
-```python
-from examples.tolaai_client import TolaTelegramDeliveryClient
-
-client = TolaTelegramDeliveryClient(
-    base_url=settings.telegram_delivery_url,
-    token=settings.telegram_delivery_token,
-)
-
+filename = f"tolaai-{job.id}.{'mp4' if job.media_type == 'video' else 'jpg'}"
 delivery = await client.enqueue(
     chat_id=user.telegram_id,
-    source_url=read_url_for_object(bucket, object_key, expires_in=6 * 60 * 60),
-    filename=tola_file.filename,
-    media_kind="video",
-    mime_type=tola_file.mime_type,
-    expected_size_bytes=tola_file.size_bytes,
+    source_url=read_url_for_object(
+        result_file.s3_bucket,
+        result_file.s3_key,
+        expires_in=8 * 60 * 60,
+    ),
+    filename=filename,
+    media_kind=job.media_type,
+    mime_type=result_file.mime_type,
+    expected_size_bytes=result_file.size_bytes,
     caption="Генерация готова",
-    idempotency_key=f"generation:{generation.id}:telegram:v1",
+    reply_markup=reply_markup.to_dict() if reply_markup else None,
+    idempotency_key=f"generation:{job.id}:recipient:{user.id}:telegram:v1",
 )
 ```
 
-Store `delivery["id"]` on the generation/job record if the UI needs delivery
-progress. A `202 queued` response means the file was accepted, not delivered.
-Poll `GET /v1/deliveries/{id}` or add a small background reconciliation task.
+`Idempotency-Key` is required. Repeating the same key and payload returns the
+same job; a different payload returns `409`. A timeout may be retried only with
+that same key and payload. A `202` means queued, not sent. For large or unknown
+sizes, never fall back to `BytesIO`, cloud upload, or a signed URL passed to
+Telegram. The delivery worker performs one document fallback only for known
+media-format errors; transient errors use bounded retries.
 
-The idempotency key must be stable for the same generation and recipient. This
-prevents a browser retry or task retry from sending the same result twice.
+Persist the generation-to-delivery mapping until `DELIVERY_JOB_TTL_SECONDS`.
+Prefer a dedicated row unique on generation, recipient, and action revision,
+containing only delivery ID, state, stable error code, and timestamps. A
+temporary no-migration option is `payload["telegram_delivery"]`, updated with
+row locking so concurrent payload writes are not lost. Never persist the
+signed URL, token, or chat ID in that metadata. A background reconciliation
+task must poll `GET /v1/deliveries/{id}` through `sent` or `failed`, and an
+authenticated TolaAI endpoint should expose only sanitized delivery status to
+the Mini App. Show `202` as queued, not sent. Do not enable the feature flag
+without persistence and reconciliation.
 
-## 4. Deployment order
+## 4. Production-only rollout
 
-1. Configure credentials and trusted S3 hosts in this service.
-2. Build and start the stack; verify Redis, worker heartbeat, and local `getMe`.
-3. Attach a staging TolaAI deployment to `tola-telegram` and switch all bot
-   constructors to the factory.
-4. In a maintenance window, execute the one-time cloud `logOut` command.
-5. Restart all TolaAI bot-using processes and run the smoke tests below.
-6. Enable large-file delivery for a small cohort, then ramp to all users.
+There is no separate staging server. First deploy a compatibility TolaAI
+release with the shared factory, delivery client, and a disabled feature flag,
+while it still uses the cloud. Start the delivery API, Redis, and local Bot API
+dark and verify local tests, Compose, liveness, Redis, disk, and sanitized logs.
+The worker cannot pass its startup `getMe`, publish a heartbeat, or make
+readiness healthy before the one-time `logOut`; do not claim those checks at
+this stage. In a maintenance window stop every bot-token process, execute
+`logOut`, switch all processes to the local root together, start the worker,
+require heartbeat/readiness, restore the webhook, and smoke-test normal bot
+functions plus 1/49 MiB. Only then enable queued delivery and test 50/51 MiB.
 
-## 5. Required smoke tests
+Stop rollout on unstable readiness, growing queue age, disk at 70%, increasing
+terminal access/size errors, duplicates, or any failed normal bot function.
 
-- Existing webhook/update handling still works through the local server.
-- Bot menu refresh, payment notifications, referrals, and generation tasks all
-  use the local URL (verify outbound traffic or logs).
-- Send a 1 MB document, a 49 MB video, a 51 MB video, and a file larger than
-  the old application threshold.
-- Invalid media falls back to a document once, without duplicate messages.
-- Repeating the same idempotency key returns the same delivery id.
-- Stop the Bot API server during a send; the job becomes `retry_scheduled` and
-  later reaches `sent`.
-- Expired S3 URLs fail with a useful terminal status and do not expose the
-  signed URL in the API response.
+## 5. Required evidence
 
-## 6. Rollback constraint
+Local automated tests cover 49/50/51 MiB and unknown routing, idempotency and
+conflict, exact downloaded size, timeout/retry-after/max attempts, safe media
+fallback, atomic Redis recovery, and structured readiness failure. Real
+webhook, post-cutover `getMe`, and large Telegram sends remain production smoke
+tests and must not be reported as locally verified.
 
-Do not point some TolaAI processes back to `api.telegram.org` while others use
-the local server. If the local service must be rolled back, stop all bot
-processes, follow Telegram's cloud re-login requirements, switch the base URLs
-as one change, and restart them together.
+End-to-end 2 GB readiness is also blocked by TolaAI's current result archive:
+`backend/tasks/generation_tasks.py::_archive_result` retains the provider body
+and preview source in `response.content`. Address that in a separate streaming
+archive-to-S3/temp-file change before claiming 2 GB generation support.
+
+## 6. Stop and rollback
+
+To stop only queued routing, disable the feature flag, stop new enqueue calls,
+and drain or deliberately stop the queue. Keep the local Bot API running and
+roll back only to the prevalidated compatibility release that routes every bot
+client locally.
+
+A full cloud return is a separate maintenance operation: stop all bot processes
+and the worker, delete the webhook and call local `close` per Telegram guidance,
+switch every process to cloud URLs together, restore the webhook, and verify
+updates before stopping the local stack. There is no automatic cloud fallback
+after `logOut`.

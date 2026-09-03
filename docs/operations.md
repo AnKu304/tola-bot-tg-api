@@ -27,8 +27,9 @@ Alert when:
 - queue age is above the signed S3 URL lifetime;
 - local Bot API logs repeated authorization, flood-control, or file errors.
 
-The worker logs IDs, chat IDs, byte counts, and stable error codes. It never logs
-the signed source URL query string or the bot token.
+The worker logs the job correlation ID, `APP_RELEASE`, operation stage, stable
+error class, byte counts, and attempt number. It does not log chat IDs, signed
+source URLs, bot tokens, or other personal data.
 
 ## Capacity
 
@@ -52,6 +53,31 @@ accepts a message but before Redis stores `sent` can produce one duplicate on
 recovery; this is an unavoidable boundary without a Telegram-side idempotency
 primitive. Monitor restarts and reconcile by `telegram_message_id` where
 possible.
+
+On startup the single worker service removes orphaned UUID-named work
+directories left by `SIGKILL`, then atomically moves Redis processing claims
+back to pending with `LMOVE`. A cleanup
+failure is reported without its path and does not create an endless restart
+loop. Unknown non-job directories are not removed. Retry state, delayed-set
+membership, and processing-claim release are committed in one Redis
+transaction, preventing a recovered pending copy and a delayed copy from
+coexisting after a crash.
+
+## Timeouts, retries, and stop criteria
+
+- `SOURCE_READ_TIMEOUT_SECONDS` limits an individual stalled read;
+- `SOURCE_TOTAL_TIMEOUT_SECONDS` bounds the complete download, including a
+  trickle response;
+- `REDIS_HEALTH_TIMEOUT_SECONDS` bounds each Redis readiness operation;
+- `TELEGRAM_SEND_TIMEOUT_SECONDS` bounds an upload;
+- `TELEGRAM_HEALTH_TIMEOUT_SECONDS` keeps readiness checks short;
+- retry uses bounded exponential delay and honors Telegram `retry_after`.
+
+Stop rollout and keep the feature flag disabled if readiness is not stable,
+queue age grows continuously, disk reaches 70%, `failed` grows for
+authentication/access/size errors, duplicate messages appear, or direct bot
+operations fail through the local server. Do not compensate by sending large
+files through the cloud or by exposing signed URLs to Telegram.
 
 ## Updating the official server
 

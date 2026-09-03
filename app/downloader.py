@@ -48,7 +48,14 @@ async def download_to_path(
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
         for redirect_number in range(settings.source_max_redirects + 1):
-            validate_source_url(current_url, settings)
+            try:
+                validate_source_url(current_url, settings)
+            except ValueError as exc:
+                raise DownloadError(
+                    "source URL or redirect is not allowed",
+                    retryable=False,
+                    code="source_url_not_allowed",
+                ) from exc
             try:
                 async with client.stream("GET", current_url) as response:
                     if response.is_redirect:
@@ -115,7 +122,7 @@ async def download_to_path(
                     )
             except DownloadError:
                 raise
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            except httpx.HTTPError as exc:
                 raise DownloadError("source download failed temporarily", retryable=True) from exc
         raise DownloadError("too many source redirects", retryable=False)
     except Exception:

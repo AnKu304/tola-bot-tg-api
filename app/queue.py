@@ -11,6 +11,10 @@ from app.config import Settings
 from app.models import DeliveryRequest, DeliveryState, StoredDelivery
 
 
+class IdempotencyConflictError(Exception):
+    """The same idempotency key was already used for another request."""
+
+
 class DeliveryQueue:
     def __init__(self, redis: Redis, settings: Settings) -> None:
         self.redis = redis
@@ -48,9 +52,16 @@ class DeliveryQueue:
                     await pipe.watch(redis_idempotency_key)
                     existing_id = await pipe.get(redis_idempotency_key)
                     if existing_id:
-                        job = await self.get(existing_id.decode())
+                        decoded_id = (
+                            existing_id.decode()
+                            if isinstance(existing_id, bytes)
+                            else str(existing_id)
+                        )
+                        job = await self.get(decoded_id)
                         if job is not None:
                             await pipe.reset()
+                            if job.request != request:
+                                raise IdempotencyConflictError
                             return job, False
                     job = StoredDelivery(
                         id=str(uuid.uuid4()), state=DeliveryState.QUEUED, request=request
@@ -103,20 +114,35 @@ class DeliveryQueue:
         """Return jobs left unacknowledged by a previous worker process."""
         recovered = 0
         while True:
-            job_id = await self.redis.lpop(self.settings.redis_processing_queue_name)
+            job_id = await self.redis.lmove(
+                self.settings.redis_processing_queue_name,
+                self.settings.redis_queue_name,
+                src="LEFT",
+                dest="LEFT",
+            )
             if job_id is None:
                 return recovered
-            await self.redis.lpush(self.settings.redis_queue_name, job_id)
             recovered += 1
 
     async def schedule_retry(self, job: StoredDelivery, delay_seconds: int) -> None:
         job.state = DeliveryState.RETRY_SCHEDULED
         job.next_attempt_at = datetime.fromtimestamp(time.time() + delay_seconds, tz=UTC)
-        await self.save(job)
-        await self.redis.zadd(
-            self.settings.redis_retry_queue_name,
-            {job.id: job.next_attempt_at.timestamp()},
-        )
+        job.updated_at = datetime.now(UTC)
+        async with self.redis.pipeline(transaction=True) as pipe:
+            pipe.set(
+                self._job_key(job.id),
+                job.model_dump_json(),
+                ex=self.settings.delivery_job_ttl_seconds,
+            )
+            pipe.zadd(
+                self.settings.redis_retry_queue_name,
+                {job.id: job.next_attempt_at.timestamp()},
+            )
+            # Moving to delayed retry and releasing the processing claim must
+            # be one transaction. Otherwise a crash can recover the claim to
+            # pending while the same job is also present in the retry set.
+            pipe.lrem(self.settings.redis_processing_queue_name, 1, job.id)
+            await pipe.execute()
 
     async def promote_due_retries(self, limit: int = 100) -> int:
         script = """

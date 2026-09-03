@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from redis.asyncio import Redis
@@ -11,7 +13,7 @@ from app import __version__
 from app.config import Settings, get_settings
 from app.logging_config import configure_logging
 from app.models import DeliveryRequest, DeliveryStatus
-from app.queue import DeliveryQueue
+from app.queue import DeliveryQueue, IdempotencyConflictError
 from app.security import require_internal_token, validate_source_url
 from app.telegram_client import TelegramBotAPIClient
 
@@ -67,11 +69,17 @@ def create_app(
         delivery_queue: DeliveryQueue = request.app.state.queue
         checks: dict[str, str] = {}
         try:
-            await delivery_queue.redis.ping()
+            async with asyncio.timeout(configured_settings.redis_health_timeout_seconds):
+                await delivery_queue.redis.ping()
             checks["redis"] = "ok"
         except Exception:
             checks["redis"] = "failed"
-        checks["worker"] = "ok" if await delivery_queue.worker_is_alive() else "failed"
+        try:
+            async with asyncio.timeout(configured_settings.redis_health_timeout_seconds):
+                worker_alive = await delivery_queue.worker_is_alive()
+            checks["worker"] = "ok" if worker_alive else "failed"
+        except Exception:
+            checks["worker"] = "failed"
         telegram = TelegramBotAPIClient(configured_settings)
         try:
             await telegram.get_me()
@@ -81,6 +89,15 @@ def create_app(
         finally:
             await telegram.close()
         if any(value != "ok" for value in checks.values()):
+            failed_checks = ",".join(
+                name for name, value in checks.items() if value != "ok"
+            )
+            logger.warning(
+                "delivery_event stage=readiness error_class=dependency_unavailable "
+                "release=%s correlation_id=health failed_checks=%s",
+                configured_settings.app_release,
+                failed_checks,
+            )
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=checks)
         return {"status": "ok", **checks}
 
@@ -93,13 +110,11 @@ def create_app(
     )
     async def create_delivery(
         body: DeliveryRequest,
+        idempotency_key: Annotated[
+            str,
+            Header(alias="Idempotency-Key", min_length=1, max_length=160),
+        ],
         delivery_queue: DeliveryQueue = Depends(get_queue),  # noqa: B008
-        idempotency_key: str | None = Header(
-            default=None,
-            alias="Idempotency-Key",
-            min_length=1,
-            max_length=160,
-        ),
     ) -> DeliveryStatus:
         if (
             body.expected_size_bytes is not None
@@ -110,7 +125,16 @@ def create_app(
             validate_source_url(str(body.source_url), configured_settings)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        job, _created = await delivery_queue.create(body, idempotency_key)
+        idempotency_key = idempotency_key.strip()
+        if not idempotency_key:
+            raise HTTPException(status_code=422, detail="Idempotency-Key must not be blank")
+        try:
+            job, _created = await delivery_queue.create(body, idempotency_key)
+        except IdempotencyConflictError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Idempotency-Key was already used for a different delivery",
+            ) from exc
         return DeliveryStatus.from_stored(job)
 
     @app.get(

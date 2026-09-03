@@ -1,10 +1,33 @@
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Any, Literal
 
 import httpx
 
 MediaKind = Literal["document", "video", "photo", "audio", "animation"]
+CLOUD_UPLOAD_LIMIT_BYTES = 50 * 1024 * 1024
+
+
+class DeliveryRoute(StrEnum):
+    DIRECT = "direct"
+    QUEUE = "queue"
+
+
+def choose_delivery_route(expected_size_bytes: int | None) -> DeliveryRoute:
+    """Choose the TolaAI delivery path before reading an S3 object into memory.
+
+    Files at the cloud limit are queued conservatively. After the mandatory
+    cloud-to-local cutover, ``DIRECT`` still means the configured local Bot API,
+    never api.telegram.org.
+    """
+    if expected_size_bytes is None:
+        return DeliveryRoute.QUEUE
+    if expected_size_bytes <= 0:
+        raise ValueError("routing requires positive expected_size_bytes")
+    if expected_size_bytes >= CLOUD_UPLOAD_LIMIT_BYTES:
+        return DeliveryRoute.QUEUE
+    return DeliveryRoute.DIRECT
 
 
 class TolaTelegramDeliveryClient:
