@@ -13,7 +13,7 @@ from app.config import Settings
 from app.downloader import DownloadResult
 from app.models import DeliveryRequest, DeliveryState, MediaKind, StoredDelivery
 from app.telegram_client import TelegramAPIError
-from app.worker import cleanup_stale_work_dirs, consume, process_job
+from app.worker import cleanup_stale_work_dirs, consume, create_worker_redis, process_job
 
 
 class FakeQueue:
@@ -43,6 +43,19 @@ class FakeTelegram:
             # Exercise video-to-document fallback file_id handling.
             "document": {"file_id": "telegram-file-id"},
         }
+
+
+@pytest.mark.asyncio
+async def test_worker_redis_timeout_exceeds_blocking_queue_wait(
+    settings: Settings,
+) -> None:
+    redis = create_worker_redis(settings)
+    try:
+        connection_settings = redis.connection_pool.connection_kwargs
+        assert connection_settings["socket_timeout"] == 15.0
+        assert connection_settings["socket_timeout"] > 5
+    finally:
+        await redis.aclose()
 
 
 @pytest.mark.asyncio
@@ -101,7 +114,7 @@ async def test_worker_sends_and_removes_temporary_file(
     assert "stage=sending" in caplog.text
     assert "stage=sent" in caplog.text
     assert "error_class=none" in caplog.text
-    assert "release=unknown" in caplog.text
+    assert f"release={settings.app_release}" in caplog.text
     assert "correlation_id=job-1" in caplog.text
     assert "chat_id" not in caplog.text
     assert "signature=" not in caplog.text
