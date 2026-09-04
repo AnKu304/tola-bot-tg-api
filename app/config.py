@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     redis_retry_queue_name: str = "tola:telegram:delivery-retries"
     redis_key_prefix: str = "tola:telegram"
     redis_health_timeout_seconds: float = 3.0
+    redis_worker_socket_timeout_seconds: float = 15.0
 
     delivery_temp_dir: Path = Path("/var/lib/tola-bot/files")
     delivery_max_file_bytes: int = 2_000_000_000
@@ -88,6 +89,11 @@ class Settings(BaseSettings):
             errors.append("TELEGRAM_HEALTH_TIMEOUT_SECONDS must be greater than 0")
         if self.redis_health_timeout_seconds <= 0:
             errors.append("REDIS_HEALTH_TIMEOUT_SECONDS must be greater than 0")
+        if self.redis_worker_socket_timeout_seconds <= 5:
+            errors.append(
+                "REDIS_WORKER_SOCKET_TIMEOUT_SECONDS must be greater than "
+                "the 5-second queue wait"
+            )
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", self.app_release):
             errors.append("APP_RELEASE must be a 1-64 character release label")
         return errors

@@ -20,6 +20,14 @@ from app.telegram_client import TelegramAPIError, TelegramBotAPIClient
 logger = logging.getLogger(__name__)
 
 
+def create_worker_redis(settings: Settings) -> Redis:
+    """Create a Redis client whose read timeout exceeds the blocking queue wait."""
+    return Redis.from_url(
+        settings.redis_url,
+        socket_timeout=settings.redis_worker_socket_timeout_seconds,
+    )
+
+
 def cleanup_stale_work_dirs(temp_dir: Path) -> tuple[int, int]:
     """Remove orphaned per-job directories left by a hard worker crash."""
     removed = 0
@@ -248,7 +256,7 @@ async def worker_main() -> None:
         raise RuntimeError("; ".join(errors))
     configure_logging(settings.log_level)
     settings.delivery_temp_dir.mkdir(parents=True, exist_ok=True)
-    redis = Redis.from_url(settings.redis_url)
+    redis = create_worker_redis(settings)
     queue = DeliveryQueue(redis, settings)
     telegram = TelegramBotAPIClient(settings)
     download_client = httpx.AsyncClient(
