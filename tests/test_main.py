@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -7,6 +8,7 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.main import create_app
 from app.models import DeliveryRequest, DeliveryState, StoredDelivery
+from app.queue import IdempotencyConflictError
 
 
 class StubQueue:
@@ -62,7 +64,83 @@ def test_delivery_api_rejects_announced_oversize(settings: Settings) -> None:
     with TestClient(app) as client:
         response = client.post(
             "/v1/deliveries",
-            headers={"Authorization": f"Bearer {settings.api_token}"},
+            headers={
+                "Authorization": f"Bearer {settings.api_token}",
+                "Idempotency-Key": "generation-oversize",
+            },
             json=payload(expected_size_bytes=1025),
         )
     assert response.status_code == 413
+
+
+def test_delivery_api_requires_idempotency_key(settings: Settings) -> None:
+    app = create_app(settings=settings, queue=StubQueue())  # type: ignore[arg-type]
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/deliveries",
+            headers={"Authorization": f"Bearer {settings.api_token}"},
+            json=payload(),
+        )
+    assert response.status_code == 422
+
+
+def test_delivery_api_reports_idempotency_conflict(settings: Settings) -> None:
+    class ConflictingQueue(StubQueue):
+        async def create(
+            self, request: DeliveryRequest, idempotency_key: str | None
+        ) -> tuple[StoredDelivery, bool]:
+            raise IdempotencyConflictError
+
+    app = create_app(settings=settings, queue=ConflictingQueue())  # type: ignore[arg-type]
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/deliveries",
+            headers={
+                "Authorization": f"Bearer {settings.api_token}",
+                "Idempotency-Key": "generation-conflict",
+            },
+            json=payload(),
+        )
+    assert response.status_code == 409
+
+
+def test_ready_returns_structured_503_when_redis_is_down(settings: Settings) -> None:
+    class BrokenRedis:
+        async def ping(self) -> None:
+            raise ConnectionError("redis is down")
+
+    class BrokenQueue(StubQueue):
+        redis = BrokenRedis()
+
+        async def worker_is_alive(self) -> bool:
+            raise ConnectionError("redis is down")
+
+    app = create_app(settings=settings, queue=BrokenQueue())  # type: ignore[arg-type]
+    with TestClient(app) as client:
+        response = client.get("/health/ready")
+    assert response.status_code == 503
+    assert response.json()["detail"]["redis"] == "failed"
+    assert response.json()["detail"]["worker"] == "failed"
+
+
+def test_ready_bounds_hanging_redis_checks(settings: Settings) -> None:
+    settings.redis_health_timeout_seconds = 0.01
+
+    class HangingRedis:
+        async def ping(self) -> None:
+            await asyncio.sleep(1)
+
+    class HangingQueue(StubQueue):
+        redis = HangingRedis()
+
+        async def worker_is_alive(self) -> bool:
+            await asyncio.sleep(1)
+            return True
+
+    app = create_app(settings=settings, queue=HangingQueue())  # type: ignore[arg-type]
+    with TestClient(app) as client:
+        response = client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["redis"] == "failed"
+    assert response.json()["detail"]["worker"] == "failed"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -25,6 +26,7 @@ class Settings(BaseSettings):
     redis_processing_queue_name: str = "tola:telegram:delivery-processing"
     redis_retry_queue_name: str = "tola:telegram:delivery-retries"
     redis_key_prefix: str = "tola:telegram"
+    redis_health_timeout_seconds: float = 3.0
 
     delivery_temp_dir: Path = Path("/var/lib/tola-bot/files")
     delivery_max_file_bytes: int = 2_000_000_000
@@ -39,11 +41,14 @@ class Settings(BaseSettings):
     source_max_redirects: int = 5
     source_connect_timeout_seconds: float = 15.0
     source_read_timeout_seconds: float = 180.0
+    source_total_timeout_seconds: float = 2 * 60 * 60
 
     telegram_connect_timeout_seconds: float = 15.0
     telegram_send_timeout_seconds: float = 2 * 60 * 60
+    telegram_health_timeout_seconds: float = 5.0
 
     log_level: str = "INFO"
+    app_release: str = "unknown"
 
     @property
     def api_token(self) -> str:
@@ -73,6 +78,18 @@ class Settings(BaseSettings):
             errors.append("DELIVERY_MAX_FILE_BYTES must be between 1 and 2000000000")
         if self.delivery_worker_concurrency < 1:
             errors.append("DELIVERY_WORKER_CONCURRENCY must be at least 1")
+        if self.delivery_max_attempts < 1:
+            errors.append("DELIVERY_MAX_ATTEMPTS must be at least 1")
+        if self.delivery_job_ttl_seconds < 1:
+            errors.append("DELIVERY_JOB_TTL_SECONDS must be at least 1")
+        if self.source_total_timeout_seconds <= 0:
+            errors.append("SOURCE_TOTAL_TIMEOUT_SECONDS must be greater than 0")
+        if self.telegram_health_timeout_seconds <= 0:
+            errors.append("TELEGRAM_HEALTH_TIMEOUT_SECONDS must be greater than 0")
+        if self.redis_health_timeout_seconds <= 0:
+            errors.append("REDIS_HEALTH_TIMEOUT_SECONDS must be greater than 0")
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", self.app_release):
+            errors.append("APP_RELEASE must be a 1-64 character release label")
         return errors
 
 

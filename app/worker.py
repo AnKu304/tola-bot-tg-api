@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+import uuid
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -16,6 +18,29 @@ from app.queue import DeliveryQueue
 from app.telegram_client import TelegramAPIError, TelegramBotAPIClient
 
 logger = logging.getLogger(__name__)
+
+
+def cleanup_stale_work_dirs(temp_dir: Path) -> tuple[int, int]:
+    """Remove orphaned per-job directories left by a hard worker crash."""
+    removed = 0
+    failed = 0
+    if not temp_dir.exists():
+        return removed, failed
+    for child in temp_dir.iterdir():
+        if not child.is_dir():
+            continue
+        try:
+            uuid.UUID(child.name)
+        except ValueError:
+            continue
+        try:
+            shutil.rmtree(child)
+            removed += 1
+        except OSError:
+            # A single damaged directory must not create a permanent restart
+            # loop. The failure count is logged without exposing its path.
+            failed += 1
+    return removed, failed
 
 
 def _telegram_file_id(message: dict[str, Any]) -> str | None:
@@ -40,6 +65,7 @@ async def process_job(
     *,
     download_client: httpx.AsyncClient,
 ) -> None:
+    stage = "precheck"
     job.attempts += 1
     job.next_attempt_at = None
     job.error_code = None
@@ -57,22 +83,57 @@ async def process_job(
                 code="file_too_large",
             )
 
+        stage = "downloading"
         job.state = DeliveryState.DOWNLOADING
         await queue.save(job)
-        download = await download_to_path(
-            str(job.request.source_url),
-            file_path,
-            settings,
-            client=download_client,
+        logger.info(
+            "delivery_event stage=downloading error_class=none release=%s "
+            "correlation_id=%s attempt=%s",
+            settings.app_release,
+            job.id,
+            job.attempts,
         )
+        try:
+            async with asyncio.timeout(settings.source_total_timeout_seconds):
+                download = await download_to_path(
+                    str(job.request.source_url),
+                    file_path,
+                    settings,
+                    client=download_client,
+                )
+        except TimeoutError as exc:
+            raise DownloadError(
+                "source download exceeded the total time limit",
+                retryable=True,
+                code="download_timeout",
+            ) from exc
         job.downloaded_size_bytes = download.size_bytes
+        if (
+            job.request.expected_size_bytes is not None
+            and download.size_bytes != job.request.expected_size_bytes
+        ):
+            raise DownloadError(
+                "downloaded size does not match expected_size_bytes",
+                retryable=False,
+                code="source_size_mismatch",
+            )
+        stage = "sending"
         job.state = DeliveryState.SENDING
         await queue.save(job)
+        logger.info(
+            "delivery_event stage=sending error_class=none release=%s "
+            "correlation_id=%s bytes=%s attempt=%s",
+            settings.app_release,
+            job.id,
+            job.downloaded_size_bytes,
+            job.attempts,
+        )
         message = await telegram.send_file(
             job.request,
             file_path,
             job.request.mime_type or download.content_type,
         )
+        stage = "finalize"
         job.state = DeliveryState.SENT
         job.telegram_message_id = (
             int(message["message_id"]) if message.get("message_id") is not None else None
@@ -80,9 +141,10 @@ async def process_job(
         job.telegram_file_id = _telegram_file_id(message)
         await queue.save(job)
         logger.info(
-            "delivery sent job_id=%s chat_id=%s bytes=%s attempts=%s",
+            "delivery_event stage=sent error_class=none release=%s "
+            "correlation_id=%s bytes=%s attempts=%s",
+            settings.app_release,
             job.id,
-            job.request.chat_id,
             job.downloaded_size_bytes,
             job.attempts,
         )
@@ -96,9 +158,12 @@ async def process_job(
             )
             await queue.schedule_retry(job, delay)
             logger.warning(
-                "delivery retry scheduled job_id=%s code=%s delay=%s attempt=%s",
-                job.id,
+                "delivery_event stage=%s state=retry_scheduled error_class=%s "
+                "release=%s correlation_id=%s delay=%s attempt=%s",
+                stage,
                 exc.code,
+                settings.app_release,
+                job.id,
                 delay,
                 job.attempts,
             )
@@ -106,13 +171,24 @@ async def process_job(
             job.state = DeliveryState.FAILED
             await queue.save(job)
             logger.error(
-                "delivery failed job_id=%s code=%s attempts=%s",
-                job.id,
+                "delivery_event stage=%s state=failed error_class=%s release=%s "
+                "correlation_id=%s attempts=%s",
+                stage,
                 exc.code,
+                settings.app_release,
+                job.id,
                 job.attempts,
             )
-    except Exception:
-        logger.exception("unexpected delivery failure job_id=%s", job.id)
+    except Exception as exc:
+        logger.error(
+            "delivery_event stage=%s state=error error_class=internal_error release=%s "
+            "correlation_id=%s exception_type=%s attempt=%s",
+            stage,
+            settings.app_release,
+            job.id,
+            type(exc).__name__,
+            job.attempts,
+        )
         job.error_code = "internal_error"
         job.error_message = "Unexpected delivery worker error"
         if job.attempts < settings.delivery_max_attempts:
@@ -139,8 +215,15 @@ async def consume(
             continue
         job = await queue.get(job_id)
         if job is None or job.state in {DeliveryState.SENT, DeliveryState.FAILED}:
+            await queue.acknowledge(job_id)
             continue
-        logger.info("worker=%s processing job_id=%s", worker_number, job_id)
+        logger.info(
+            "delivery_event stage=claimed error_class=none release=%s "
+            "correlation_id=%s worker=%s",
+            settings.app_release,
+            job_id,
+            worker_number,
+        )
         await process_job(
             job,
             queue,
@@ -179,10 +262,32 @@ async def worker_main() -> None:
     )
     try:
         await redis.ping()
+        stale_dirs, cleanup_failures = await asyncio.to_thread(
+            cleanup_stale_work_dirs, settings.delivery_temp_dir
+        )
+        if stale_dirs:
+            logger.warning(
+                "delivery_event stage=startup_cleanup error_class=orphaned_temp_files "
+                "release=%s correlation_id=startup removed=%s",
+                settings.app_release,
+                stale_dirs,
+            )
+        if cleanup_failures:
+            logger.error(
+                "delivery_event stage=startup_cleanup error_class=cleanup_failed "
+                "release=%s correlation_id=startup failed=%s",
+                settings.app_release,
+                cleanup_failures,
+            )
         await telegram.get_me()
         recovered = await queue.recover_processing()
         if recovered:
-            logger.warning("recovered unacknowledged deliveries count=%s", recovered)
+            logger.warning(
+                "delivery_event stage=startup_recovery error_class=unacknowledged_jobs "
+                "release=%s correlation_id=startup recovered=%s",
+                settings.app_release,
+                recovered,
+            )
         await asyncio.gather(
             heartbeat(queue, settings),
             *(

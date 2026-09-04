@@ -52,7 +52,17 @@ class TelegramBotAPIClient:
             await self.client.aclose()
 
     async def get_me(self) -> dict[str, Any]:
-        response = await self.client.post(self._method_url("getMe"))
+        try:
+            response = await self.client.post(
+                self._method_url("getMe"),
+                timeout=self.settings.telegram_health_timeout_seconds,
+            )
+        except httpx.HTTPError as exc:
+            raise TelegramAPIError(
+                "local Telegram Bot API is temporarily unavailable",
+                retryable=True,
+                code="telegram_unavailable",
+            ) from exc
         return self._parse_response(response)
 
     async def send_file(
@@ -117,7 +127,7 @@ class TelegramBotAPIClient:
                         data=payload,
                         files={field: (request.filename, upload, content_type)},
                     )
-        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        except httpx.HTTPError as exc:
             raise TelegramAPIError(
                 "local Telegram Bot API is temporarily unavailable",
                 retryable=True,
@@ -132,9 +142,21 @@ class TelegramBotAPIClient:
         except ValueError as exc:
             raise TelegramAPIError(
                 f"local Telegram Bot API returned HTTP {response.status_code}",
-                retryable=response.status_code >= 500,
+                retryable=(
+                    response.status_code in {408, 425, 429}
+                    or response.status_code >= 500
+                ),
                 code="telegram_invalid_response",
             ) from exc
+        if not isinstance(body, dict):
+            raise TelegramAPIError(
+                f"local Telegram Bot API returned HTTP {response.status_code}",
+                retryable=(
+                    response.status_code in {408, 425, 429}
+                    or response.status_code >= 500
+                ),
+                code="telegram_invalid_response",
+            )
         if response.status_code < 400 and body.get("ok") is True:
             result = body.get("result")
             return result if isinstance(result, dict) else {"result": result}
@@ -145,7 +167,7 @@ class TelegramBotAPIClient:
         description = str(body.get("description") or f"Telegram error {error_code}")
         raise TelegramAPIError(
             description[:500],
-            retryable=error_code == 429 or error_code >= 500,
+            retryable=error_code in {408, 425, 429} or error_code >= 500,
             retry_after=int(retry_after) if retry_after is not None else None,
             code=f"telegram_{error_code}",
         )

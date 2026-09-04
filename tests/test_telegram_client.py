@@ -7,7 +7,7 @@ import pytest
 
 from app.config import Settings
 from app.models import DeliveryRequest, MediaKind
-from app.telegram_client import TelegramBotAPIClient
+from app.telegram_client import TelegramAPIError, TelegramBotAPIClient
 
 
 @pytest.mark.asyncio
@@ -77,3 +77,122 @@ async def test_invalid_video_falls_back_once_to_document(
 
     assert methods == ["sendVideo", "sendDocument"]
     assert result["document"]["file_id"] == "document-v1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [408, 429, 500, 503])
+async def test_transient_http_errors_are_retryable(
+    settings: Settings, status_code: int
+) -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, content=b"not-json")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = TelegramBotAPIClient(settings, client=http_client)
+        with pytest.raises(TelegramAPIError) as exc_info:
+            await client.get_me()
+
+    assert exc_info.value.retryable is True
+    assert exc_info.value.code == "telegram_invalid_response"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [[], "unexpected", 42])
+async def test_non_object_json_is_a_stable_invalid_response(
+    settings: Settings, body: object
+) -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = TelegramBotAPIClient(settings, client=http_client)
+        with pytest.raises(TelegramAPIError) as exc_info:
+            await client.get_me()
+
+    assert exc_info.value.retryable is False
+    assert exc_info.value.code == "telegram_invalid_response"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", [408, 425, 429, 500, 503])
+async def test_transient_json_errors_are_retryable(
+    settings: Settings, error_code: int
+) -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            error_code,
+            json={
+                "ok": False,
+                "error_code": error_code,
+                "description": "temporary failure",
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = TelegramBotAPIClient(settings, client=http_client)
+        with pytest.raises(TelegramAPIError) as exc_info:
+            await client.get_me()
+
+    assert exc_info.value.retryable is True
+    assert exc_info.value.code == f"telegram_{error_code}"
+
+
+@pytest.mark.asyncio
+async def test_retryable_media_error_never_falls_back_to_document(
+    settings: Settings, tmp_path: Path
+) -> None:
+    file_path = tmp_path / "clip.mp4"
+    file_path.write_bytes(b"video")
+    methods: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.url.path.rsplit("/", 1)[-1])
+        return httpx.Response(
+            503,
+            json={"ok": False, "error_code": 503, "description": "Failed to process"},
+        )
+
+    request = DeliveryRequest(
+        chat_id=42,
+        source_url="https://files.example.test/clip.mp4",
+        filename="clip.mp4",
+        media_kind=MediaKind.VIDEO,
+        fallback_to_document=True,
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = TelegramBotAPIClient(settings, client=http_client)
+        with pytest.raises(TelegramAPIError) as exc_info:
+            await client.send_file(request, file_path, "video/mp4")
+
+    assert exc_info.value.retryable is True
+    assert methods == ["sendVideo"]
+
+
+@pytest.mark.asyncio
+async def test_non_format_client_error_never_falls_back_to_document(
+    settings: Settings, tmp_path: Path
+) -> None:
+    file_path = tmp_path / "clip.mp4"
+    file_path.write_bytes(b"video")
+    methods: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.url.path.rsplit("/", 1)[-1])
+        return httpx.Response(
+            400,
+            json={"ok": False, "error_code": 400, "description": "chat not found"},
+        )
+
+    request = DeliveryRequest(
+        chat_id=42,
+        source_url="https://files.example.test/clip.mp4",
+        filename="clip.mp4",
+        media_kind=MediaKind.VIDEO,
+        fallback_to_document=True,
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = TelegramBotAPIClient(settings, client=http_client)
+        with pytest.raises(TelegramAPIError):
+            await client.send_file(request, file_path, "video/mp4")
+
+    assert methods == ["sendVideo"]

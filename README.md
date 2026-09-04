@@ -44,6 +44,22 @@ Delivery API ──► Redis queue ──► Worker
 The temporary file is deleted after success or failure. Telegram stores the
 sent file; the local copy is not required after the send finishes.
 
+## Routing contract for TolaAI
+
+TolaAI must choose the route from stored metadata **before** reading the S3
+object:
+
+- below 50 MiB: the existing direct send may remain, but after cutover it must
+  use the local Bot API;
+- 50 MiB and above: enqueue this delivery service;
+- unknown size: enqueue this delivery service and let its streaming hard limit
+  protect the worker.
+
+The reference decision is `choose_delivery_route()` in
+`examples/tolaai_client.py`; tests cover 49, 50, and 51 MiB. A large or
+unknown-size delivery must never fall back to a cloud upload, in-memory upload,
+or Telegram fetching a signed URL.
+
 ## Quick start
 
 Requirements:
@@ -118,6 +134,8 @@ States: `queued`, `downloading`, `sending`, `retry_scheduled`, `sent`, `failed`.
   revalidated to prevent SSRF.
 - HTTP sources are disabled unless explicitly enabled for local MinIO.
 - Expected and streamed sizes are checked before the Bot API send.
+- `Idempotency-Key` is mandatory; reusing it with a different payload returns
+  `409` instead of silently delivering the wrong file or recipient.
 - The BotFather token never appears in queue payloads or API responses.
 - HTTP client INFO logging is disabled because Telegram bot tokens are part of
   Bot API request paths.
@@ -125,6 +143,11 @@ States: `queued`, `downloading`, `sending`, `retry_scheduled`, `sent`, `failed`.
 - A claimed job is acknowledged only after its terminal/retry state is stored;
   unacknowledged jobs are recovered after a worker restart.
 - Retries are limited and delayed; Telegram `retry_after` is respected.
+- Downloads have per-I/O and total wall-clock deadlines. Readiness uses a short
+  timeout independent of the two-hour upload timeout.
+- Worker logs use a job correlation ID, deployment release, operation stage,
+  stable error class, byte count, and attempt number. They omit chat IDs,
+  signed URLs, bot tokens, and other personal data.
 
 ## Documentation
 

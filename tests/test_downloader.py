@@ -42,13 +42,15 @@ async def test_download_revalidates_redirect_host(
 
     destination = tmp_path / "result.mp4"
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(ValueError, match="host is not allowed"):
+        with pytest.raises(DownloadError) as exc_info:
             await download_to_path(
                 "https://files.example.test/result.mp4",
                 destination,
                 settings,
                 client=client,
             )
+    assert exc_info.value.code == "source_url_not_allowed"
+    assert exc_info.value.retryable is False
     assert not destination.exists()
 
 
@@ -75,4 +77,26 @@ async def test_download_rejects_invalid_or_large_content_length(
                 settings,
                 client=client,
             )
+    assert not destination.exists()
+
+
+@pytest.mark.asyncio
+async def test_download_sanitizes_transport_errors(
+    settings: Settings, tmp_path: Path
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError("broken stream", request=request)
+
+    destination = tmp_path / "result.bin"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(DownloadError) as exc_info:
+            await download_to_path(
+                "https://files.example.test/result.bin?signature=must-not-leak",
+                destination,
+                settings,
+                client=client,
+            )
+
+    assert exc_info.value.retryable is True
+    assert "must-not-leak" not in str(exc_info.value)
     assert not destination.exists()

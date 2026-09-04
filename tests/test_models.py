@@ -6,7 +6,10 @@ from pydantic import ValidationError
 from app.models import DeliveryRequest
 
 
-@pytest.mark.parametrize("filename", ["../secret", "folder/video.mp4", ".", "bad\x00name"])
+@pytest.mark.parametrize(
+    "filename",
+    [" ", "\t", "../secret", "folder/video.mp4", ".", "bad\x00name"],
+)
 def test_filename_cannot_escape_delivery_directory(filename: str) -> None:
     with pytest.raises(ValidationError):
         DeliveryRequest(

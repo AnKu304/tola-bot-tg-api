@@ -125,39 +125,38 @@ ports:
 Официальный сервер принимает HTTP; для подключения через публичную сеть нужен
 TLS reverse proxy, но приватная сеть предпочтительнее.
 
-## 4. Добавить настройки в TolaAI
+## 4. Добавить совместимые настройки в TolaAI
 
-В `backend/core/config.py`:
+В текущем TolaAI уже есть `TELEGRAM_API_BASE_URL`. Это корневой URL **без
+`/bot`**: существующая фабрика сама добавляет суффикс. Сохраните имя и семантику
+для обратной совместимости. Если записать `/bot` в `.env`, получится ошибочный
+путь `/bot/bot<TOKEN>`.
 
 ```python
-TELEGRAM_BOT_API_BASE_URL: str = "https://api.telegram.org/bot"
-TELEGRAM_BOT_API_FILE_BASE_URL: str = "https://api.telegram.org/file/bot"
-TELEGRAM_BOT_LOCAL_MODE: bool = False
+TELEGRAM_API_BASE_URL: str = ""  # существующее поле, root без /bot
+TELEGRAM_LOCAL_MODE: bool = False
 TELEGRAM_DELIVERY_URL: str = ""
 TELEGRAM_DELIVERY_TOKEN: str = ""
+TELEGRAM_LARGE_DELIVERY_ENABLED: bool = False
+TELEGRAM_DIRECT_UPLOAD_LIMIT_BYTES: int = 50 * 1024 * 1024
 ```
 
 Production `.env` при размещении на одном сервере:
 
 ```env
-TELEGRAM_BOT_API_BASE_URL=http://tola-telegram-bot-api:8081/bot
-TELEGRAM_BOT_API_FILE_BASE_URL=http://tola-telegram-bot-api:8081/file/bot
-TELEGRAM_BOT_LOCAL_MODE=true
+TELEGRAM_API_BASE_URL=http://tola-telegram-bot-api:8081
+TELEGRAM_LOCAL_MODE=true
 TELEGRAM_DELIVERY_URL=http://tola-telegram-delivery:8080
 TELEGRAM_DELIVERY_TOKEN=<APP_API_TOKEN delivery-сервиса>
+TELEGRAM_LARGE_DELIVERY_ENABLED=false
 ```
 
-Для отдельного VDS заменить hostnames на приватный IP, например
-`http://10.20.0.2:8081/bot` и `http://10.20.0.2:8080`.
-
-В local mode метод Telegram `getFile` может вернуть абсолютный путь на диске
-delivery-VDS. В текущем TolaAI вызовов `get_file` нет. Если они появятся,
-backend на другом VDS не сможет открыть такой путь напрямую: чтение нужно
-выполнять на delivery-VDS либо дать обеим машинам безопасное общее хранилище.
+Для отдельного VDS использовать root `http://10.20.0.2:8081`, без `/bot`.
+В local mode `getFile` может вернуть путь на delivery-VDS. В текущем TolaAI
+вызовов `get_file` нет; если они появятся, чтение должно выполняться на той же
+машине либо через безопасное общее хранилище.
 
 ## 5. Создать единую фабрику Telegram-клиентов
-
-Например, `backend/services/telegram_factory.py`:
 
 ```python
 from telegram import Bot
@@ -167,156 +166,192 @@ from backend.core.config import Settings
 
 
 def build_bot(settings: Settings) -> Bot:
-    return Bot(
-        token=settings.TELEGRAM_BOT_TOKEN,
-        base_url=settings.TELEGRAM_BOT_API_BASE_URL,
-        base_file_url=settings.TELEGRAM_BOT_API_FILE_BASE_URL,
-        local_mode=settings.TELEGRAM_BOT_LOCAL_MODE,
-    )
+    kwargs = {"token": settings.TELEGRAM_BOT_TOKEN}
+    if settings.TELEGRAM_API_BASE_URL:
+        root = settings.TELEGRAM_API_BASE_URL.rstrip("/")
+        kwargs.update(
+            base_url=f"{root}/bot",
+            base_file_url=f"{root}/file/bot",
+            local_mode=settings.TELEGRAM_LOCAL_MODE,
+        )
+    return Bot(**kwargs)
 
 
 def build_application(settings: Settings) -> Application:
-    return (
-        Application.builder()
-        .token(settings.TELEGRAM_BOT_TOKEN)
-        .base_url(settings.TELEGRAM_BOT_API_BASE_URL)
-        .base_file_url(settings.TELEGRAM_BOT_API_FILE_BASE_URL)
-        .local_mode(settings.TELEGRAM_BOT_LOCAL_MODE)
-        .updater(None)
-        .build()
-    )
+    builder = Application.builder().token(settings.TELEGRAM_BOT_TOKEN)
+    if settings.TELEGRAM_API_BASE_URL:
+        root = settings.TELEGRAM_API_BASE_URL.rstrip("/")
+        builder = (
+            builder.base_url(f"{root}/bot")
+            .base_file_url(f"{root}/file/bot")
+            .local_mode(settings.TELEGRAM_LOCAL_MODE)
+        )
+    return builder.updater(None).build()
 ```
 
-Заменить прямые вызовы `Bot(...)`/`Application.builder()` минимум в:
+Проверить production-вызовы и webhook/auth contract минимум в:
 
 - `backend/bot/handlers.py`;
+- `backend/services/telegram_client.py`;
 - `backend/services/referral_service.py`;
 - `backend/tasks/generation_tasks.py`;
 - `backend/scripts/broadcast_security_notice.py`;
 - `backend/scripts/refresh_miniapp_menu_buttons.py`;
 - `backend/api/v1/endpoints/payment.py`;
-- `backend/api/v1/endpoints/generation.py`.
+- `backend/api/v1/endpoints/generation.py`;
+- `backend/core/telegram_setup.py`, `backend/main.py`, `backend/core/auth.py`;
+- `scripts/reset-telegram-webhook.sh`.
 
-Проверить ещё раз командой:
-
-```bash
-rg 'Bot\(|Application\.builder' backend
-```
-
-Все найденные production-вызовы должны использовать фабрику.
+Команда `rg 'Bot\(|Application\.builder' backend` не должна находить
+production-конструкторы в обход фабрики. Проверка `backend/core/auth.py` не
+означает изменение валидации `initData` без отдельной причины.
 
 ## 6. Подключить очередь больших файлов
 
-Скопировать или адаптировать `examples/tolaai_client.py` в backend TolaAI.
+Скопировать или адаптировать `examples/tolaai_client.py` в TolaAI. Маршрут
+выбирается по сохранённому `TolaFile.size_bytes` **до** `read_object_bytes`:
 
-Сейчас `backend/api/v1/endpoints/generation.py` читает результат из S3 целиком
-в память и передаёт `BytesIO` в Telegram. Заменить эту ветку на enqueue:
+- известный размер меньше 50 MiB (например, 49 MiB) — допустим прямой upload,
+  после cutover только через local Bot API;
+- ровно 50 MiB, 51 MiB и больше — delivery queue;
+- неизвестный размер legacy `result_url` — delivery queue; читать его целиком
+  в память «для определения размера» запрещено.
 
 ```python
-delivery = await delivery_client.enqueue(
-    chat_id=current_user.telegram_id,
-    source_url=read_url_for_object(
-        bucket,
-        object_key,
-        expires_in=6 * 60 * 60,
-    ),
-    filename=tola_file.filename,
-    media_kind="video",
-    mime_type=tola_file.mime_type,
-    expected_size_bytes=tola_file.size_bytes,
-    caption=caption,
-    reply_markup=reply_markup.to_dict() if reply_markup else None,
-    idempotency_key=f"generation:{generation.id}:telegram:v1",
-)
+expected_size = result_file.size_bytes if result_file else None
+route = choose_delivery_route(expected_size)
+
+if route is DeliveryRoute.QUEUE:
+    # Не передавать original_name без очистки: используем предсказуемое имя
+    # без пути и управляющих символов.
+    filename = f"tolaai-{job.id}.{'mp4' if job.media_type == 'video' else 'jpg'}"
+    delivery = await delivery_client.enqueue(
+        chat_id=current_user.telegram_id,
+        source_url=read_url_for_object(
+            result_file.s3_bucket,
+            result_file.s3_key,
+            expires_in=8 * 60 * 60,
+        ),
+        filename=filename,
+        media_kind=job.media_type,
+        mime_type=result_file.mime_type,
+        expected_size_bytes=result_file.size_bytes,
+        caption=caption,
+        reply_markup=reply_markup.to_dict() if reply_markup else None,
+        idempotency_key=(
+            f"generation:{job.id}:recipient:{current_user.id}:telegram:v1"
+        ),
+    )
 ```
 
-Точные имена моделей/полей разработчик должен сопоставить с текущей версией
-TolaAI. Важные правила:
+Фактические поля текущего TolaAI: `TolaFile.original_name`, `mime_type`,
+`size_bytes`, `s3_bucket`, `s3_key`; у задания — `GenerationJob.id`,
+`media_type`, `result_file_id`, `result_url`. `original_name` нельзя считать
+безопасным basename без отдельной очистки; пример сохраняет совместимое
+детерминированное имя из UUID задания и типа медиа.
 
-- не загружать S3-объект в `bytes`/`BytesIO`;
-- подписанная ссылка должна жить дольше максимального времени очереди и retry;
-- передавать `TolaFile.size_bytes`;
-- idempotency key должен быть стабильным для generation + получатель;
-- ответ `202 queued` означает принятие в очередь, а не успешную доставку;
-- при необходимости сохранять `delivery["id"]` и опрашивать
-  `GET /v1/deliveries/{id}`.
+Правила безопасности и совместимости:
 
-Для файлов меньше 50 MB тоже лучше использовать единый путь доставки: меньше
-разветвлений и одинаковая диагностика. Если старый путь временно оставляется,
-он всё равно обязан использовать local Bot API после переключения.
+- срок signed URL должен превышать допустимый возраст очереди и retry;
+- `Idempotency-Key` обязателен; повтор с тем же payload возвращает исходный
+  job, а повтор с другим payload — `409`;
+- timeout enqueue безопасно повторять только с тем же ключом и payload;
+- `202 queued` означает принятие, не доставку;
+- для большого/неизвестного размера запрещён fallback в `BytesIO`, cloud API
+  или `send_document(result_url)`;
+- media→document fallback выполняет worker один раз только для известных
+  ошибок формата; 408/425/429/5xx используют bounded retry;
+- HTTP-контракт текущего `/generate/{job_id}/send` можно оставить `204`, чтобы
+  не ломать Mini App: для queue route это означает «принято в очередь».
 
-## 7. Проверить всё до переключения
+После `202` TolaAI обязан сохранить связь generation ↔ delivery до истечения
+`DELIVERY_JOB_TTL_SECONDS`. Предпочтительный контракт — отдельная запись с
+уникальностью `(generation_id, recipient_user_id, action_version)` и полями
+`delivery_id`, `state`, `error_code`, `updated_at`; signed URL, token и chat ID
+там не хранятся. Временный совместимый вариант без миграции — вложенный
+`payload["telegram_delivery"]`, обновляемый под блокировкой строки, чтобы не
+затереть параллельные изменения payload.
+
+Фоновая reconciliation-задача опрашивает `GET /v1/deliveries/{delivery_id}` до
+`sent`/`failed`, сохраняет каждый переход и прекращает опрос до TTL. Отдельный
+авторизованный endpoint TolaAI возвращает Mini App только очищенные
+`route/state/error_code/delivery_id`. UI для `202` показывает «поставлено в
+очередь», а не «отправлено»; terminal `failed` предлагает осознанный повтор с
+новой signed URL и новой revision idempotency key. Без persistence и
+reconciliation large-delivery flag включать нельзя.
+
+Flag `TELEGRAM_LARGE_DELIVERY_ENABLED=false` сохраняет старую ветку до
+maintenance cutover. После `logOut` откатываться можно только на
+compatibility-релиз, который направляет каждый Bot/Application к local API;
+текущий `main` без такой проверки не является безопасным полным rollback.
+
+## 7. Локальные проверки до переключения
+
+Отдельного staging/dev-сервера нет. До production допустимы только
+неразрушающие локальные проверки:
 
 ```bash
-docker compose ps
-curl -fsS http://127.0.0.1:8080/health/live
-docker compose logs --tail=100 api worker telegram-bot-api redis
+uv run ruff check .
+uv run pytest -q
+ENV_FILE=.env.example docker compose config --quiet
+docker compose build api worker
 ```
 
-На staging проверить:
+Автотесты должны подтверждать 49/50/51 MiB и unknown-size routing, обязательную
+идемпотентность/conflict, exact-size check, timeout/retry-after/max-attempts,
+безопасный media fallback, Redis recovery и structured readiness 503. Реальные
+webhook, `getMe` после cutover и отправка больших файлов остаются production
+smoke-test, а не локально доказанным результатом.
 
-1. `/start` и запуск Mini App.
-2. Webhook/update handling.
-3. Платёжные уведомления.
-4. Реферальные уведомления.
-5. Обновление menu button.
-6. Документ 1 MB.
-7. Видео 49 MB.
-8. Видео 51 MB.
-9. Репрезентативный большой файл.
-10. Повтор одного `Idempotency-Key` не создаёт второе задание.
-11. Остановка Bot API во время отправки приводит к retry, затем к `sent`.
+## 8. Production-переключение без staging
 
-## 8. Production-переключение
+Проводить только в maintenance window:
 
-Проводить в maintenance window.
+1. Выложить compatibility-релиз TolaAI с единой фабрикой, delivery-клиентом и
+   feature flag, оставив flag выключенным и cloud URL пустым. Проверить старые
+   bot-функции.
+2. Поднять delivery API, Redis и local Bot API «тёмными»: проверить Compose,
+   `/health/live`, Redis, диск и обезличенность логов. До `logOut` worker не
+   пройдёт startup `getMe`, поэтому heartbeat и `/health/ready` в этот момент
+   не являются ожидаемыми проверками.
+3. Остановить все процессы TolaAI, использующие bot token.
+4. Один раз выполнить
+   `docker compose run --rm api python -m app.cli logout-cloud --confirm`.
+5. Установить root `TELEGRAM_API_BASE_URL`, включить `TELEGRAM_LOCAL_MODE` и
+   запустить local Bot API и все процессы TolaAI только с этими настройками.
+6. Восстановить webhook через local server и проверить `/health/ready`,
+   `/start`, Mini App, платежи, referrals, menu button, 1 MiB и 49 MiB.
+7. Включить large-delivery flag и проверить 50/51 MiB через очередь.
 
-1. Развернуть новую версию TolaAI, но не запускать одновременно старые
-   процессы, обращающиеся к облачному API.
-2. Остановить backend/worker/скрипты бота старой версии.
-3. Один раз выполнить:
-
-```bash
-docker compose run --rm api python -m app.cli logout-cloud --confirm
-```
-
-4. Запустить local Bot API, delivery API/worker и новую версию TolaAI.
-5. Восстановить/проверить webhook через локальный сервер.
-6. Проверить `/health/ready`:
-
-```bash
-curl -fsS http://127.0.0.1:8080/health/ready
-```
-
-7. Выполнить smoke-тест маленького и файла больше 50 MB.
-
-`logOut` нельзя выполнять при каждом deploy.
+Остановить rollout и выключить flag при нестабильном readiness, росте возраста
+очереди, диске от 70%, terminal access/size errors, дубликатах или отказе
+обычных bot-функций. Не переключать отдельные процессы обратно в cloud и не
+выполнять `logOut` при обычном deploy/restart.
 
 ## 9. Мониторинг
 
-Алерты нужны на:
+Алерты нужны на readiness, heartbeat, возраст очереди относительно signed URL,
+рост `failed`/429, диск 70/85%, частые рестарты и состояние Redis AOF.
 
-- `/health/ready` не отвечает 200;
-- worker heartbeat отсутствует;
-- очередь старше срока жизни подписанного S3 URL;
-- рост `failed` или Telegram `429`;
-- диск заполнен более чем на 70/85%;
-- частые перезапуски worker/local Bot API;
-- Redis AOF или PostgreSQL не резервируются.
+Каждый delivery log содержит `stage`, `error_class`, `release` и
+`correlation_id` (UUID job), а также безопасные bytes/attempt/delay. В логах
+запрещены `chat_id`, bot token, signed URL/query string и персональные данные.
 
-Логи не должны содержать bot token и query string подписанных S3 URL.
+Отдельное ограничение end-to-end: текущий
+`backend/tasks/generation_tasks.py::_archive_result` сначала держит ответ
+провайдера и source preview в `response.content`. До отдельного streaming
+archive → S3/temp-file patch нельзя заявлять готовность генераций размером до
+2 GB, даже если Telegram delivery уже потоковый.
 
-## 10. Откат
+## 10. Остановка и откат
 
-Нельзя оставить часть процессов на локальном сервере, а часть вернуть на
-`api.telegram.org`. Откат выполняется одной операцией:
+Для отката только маршрута сначала выключить flag, остановить постановку новых
+jobs и дождаться либо контролируемо остановить очередь. Local Bot API оставить
+работающим; версия TolaAI для rollback обязана быть заранее проверенным
+compatibility-релизом с local root URL во всех процессах.
 
-1. остановить все процессы бота;
-2. удалить webhook и вызвать `close` на локальном сервере согласно официальной
-   инструкции Telegram;
-3. вернуть cloud base URLs во всех процессах;
-4. запустить TolaAI и восстановить webhook;
-5. проверить получение updates до остановки local Bot API.
-
-Для отката только версии приложения local Bot API можно оставить работающим —
-предыдущая версия TolaAI должна быть способна использовать его base URLs.
+Полный возврат в cloud — отдельная maintenance-операция: остановить все bot
+процессы и worker, удалить webhook и вызвать `close` на local server по
+официальной инструкции, одновременно убрать local root URL во всех процессах,
+затем восстановить webhook и проверить updates. До подтверждения cloud updates
+local стек не останавливать. Автоматического cloud-fallback после `logOut` нет.
