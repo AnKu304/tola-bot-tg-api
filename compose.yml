@@ -10,10 +10,6 @@ x-delivery-service: &delivery-service
     TELEGRAM_USE_LOCAL_FILE_URI: "true"
   volumes:
     - delivery-files:/var/lib/tola-bot/files
-  networks:
-    tola-telegram:
-      aliases:
-        - tola-telegram-delivery
   restart: unless-stopped
   logging: &json-file-logging
     driver: json-file
@@ -24,6 +20,10 @@ x-delivery-service: &delivery-service
 services:
   api:
     <<: *delivery-service
+    networks:
+      tola-telegram:
+        aliases:
+          - tola-telegram-delivery
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
     ports:
       - "127.0.0.1:${DELIVERY_API_PORT:-8080}:8080"
@@ -46,6 +46,8 @@ services:
 
   worker:
     <<: *delivery-service
+    networks:
+      - tola-telegram
     command: ["python", "-m", "app.worker"]
     depends_on:
       redis:
