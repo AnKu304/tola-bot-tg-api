@@ -114,6 +114,10 @@ class TelegramBotAPIClient:
             )
         if media_kind is MediaKind.VIDEO:
             payload["supports_streaming"] = str(request.supports_streaming).lower()
+            for name in ("width", "height", "duration"):
+                value = getattr(request, name)
+                if value is not None:
+                    payload[name] = str(value)
 
         try:
             if self.settings.telegram_use_local_file_uri:
