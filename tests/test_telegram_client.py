@@ -22,6 +22,9 @@ async def test_local_file_uri_is_sent_without_multipart(
         assert request.url.path.endswith("/sendVideo")
         assert "file%3A%2F%2F" in body
         assert "supports_streaming=true" in body
+        assert "width=816" in body
+        assert "height=1104" in body
+        assert "duration=15" in body
         return httpx.Response(
             200,
             json={"ok": True, "result": {"message_id": 17, "video": {"file_id": "v1"}}},
@@ -32,6 +35,7 @@ async def test_local_file_uri_is_sent_without_multipart(
         source_url="https://files.example.test/clip.mp4",
         filename="clip.mp4",
         media_kind=MediaKind.VIDEO,
+        width=816, height=1104, duration=15,
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
         client = TelegramBotAPIClient(settings, client=http_client)
@@ -51,11 +55,14 @@ async def test_invalid_video_falls_back_once_to_document(
     async def handler(request: httpx.Request) -> httpx.Response:
         method = request.url.path.rsplit("/", 1)[-1]
         methods.append(method)
+        body = (await request.aread()).decode()
         if method == "sendVideo":
+            assert "width=816" in body and "height=1104" in body
             return httpx.Response(
                 400,
                 json={"ok": False, "error_code": 400, "description": "Failed to process"},
             )
+        assert "width=" not in body and "height=" not in body and "duration=" not in body
         return httpx.Response(
             200,
             json={
@@ -70,6 +77,7 @@ async def test_invalid_video_falls_back_once_to_document(
         filename="clip.bin",
         media_kind=MediaKind.VIDEO,
         fallback_to_document=True,
+        width=816, height=1104, duration=15,
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
         client = TelegramBotAPIClient(settings, client=http_client)

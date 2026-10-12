@@ -6,7 +6,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
 
 class MediaKind(StrEnum):
@@ -40,6 +40,19 @@ class DeliveryRequest(BaseModel):
     supports_streaming: bool = True
     fallback_to_document: bool = True
     expected_size_bytes: int | None = Field(default=None, ge=1)
+    width: int | None = Field(default=None, strict=True, ge=1, le=65535)
+    height: int | None = Field(default=None, strict=True, ge=1, le=65535)
+    duration: int | None = Field(default=None, strict=True, ge=1, le=86400)
+
+    @model_validator(mode="after")
+    def validate_video_metadata(self) -> DeliveryRequest:
+        if (self.width is None) != (self.height is None):
+            raise ValueError("video width and height must be provided together")
+        if self.media_kind is not MediaKind.VIDEO and any(
+            value is not None for value in (self.width, self.height, self.duration)
+        ):
+            raise ValueError("video metadata requires media_kind=video")
+        return self
 
     @field_validator("filename")
     @classmethod

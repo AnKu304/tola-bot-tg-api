@@ -39,12 +39,16 @@ Recommended fields:
 | `caption` | Telegram caption, max 1024 characters |
 | `reply_markup` | Bot API inline/reply keyboard JSON object |
 | `fallback_to_document` | Retry media-format failures as a document; default `true` |
+| `width`, `height` | Optional positive display dimensions for `video`; supply both from the source file or omit both |
+| `duration` | Optional positive source video duration in whole seconds, up to 86400 |
 
 The API returns `202` for both new and idempotently repeated jobs.
 `expected_size_bytes` may be omitted for legacy sources; the worker still
 streams with the configured hard ceiling. When it is supplied, the downloaded
 byte count must match exactly or the job ends as `failed` with
 `source_size_mismatch` before Telegram is called.
+Video metadata is passed to `sendVideo` when present and omitted for the
+document fallback. Existing requests without it remain valid.
 
 ## GET `/v1/deliveries/{job_id}`
 
