@@ -106,6 +106,23 @@ authenticated TolaAI endpoint should expose only sanitized delivery status to
 the Mini App. Show `202` as queued, not sent. Do not enable the feature flag
 without persistence and reconciliation.
 
+### Photo results and original quality
+
+When document fallback is enabled, `send_file` selects `sendDocument` before
+dispatch for a materialized PHOTO larger than 10 MiB (10,485,760 bytes). The
+original file is passed unchanged: no resize, recompression or filename change.
+At or below that boundary it retains `sendPhoto`. `fallback_to_document=false`
+keeps the caller's photo-only policy. Video/audio/document routing is unchanged.
+TolaAI's direct-file helper applies the same photo-size boundary.
+
+A definitive nonretryable photo size/dimension rejection may perform one
+same-call document fallback, including the Bot API message `file of size ...
+bytes is too big for a photo`. A transport timeout or retryable response does
+not trigger an additional document fallback within that call. The worker's
+existing retry policy is separate and unchanged; this is not a global guarantee
+against resending after an unknown outcome. Existing historical failed delivery
+records and TolaAI's user retry/status policy are not reopened by this fix.
+
 ## 4. Production-only rollout
 
 There is no separate staging server. First deploy a compatibility TolaAI

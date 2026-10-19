@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,8 @@ import httpx
 
 from app.config import Settings
 from app.models import DeliveryRequest, MediaKind
+
+PHOTO_MAX_BYTES = 10 * 1024 * 1024
 
 
 class TelegramAPIError(Exception):
@@ -71,12 +74,20 @@ class TelegramBotAPIClient:
         file_path: Path,
         content_type: str | None,
     ) -> dict[str, Any]:
+        media_kind = request.media_kind
+        if (
+            media_kind is MediaKind.PHOTO
+            and request.fallback_to_document
+            and (await asyncio.to_thread(file_path.stat)).st_size > PHOTO_MAX_BYTES
+        ):
+            # Preserve the materialized original; Telegram's photo limit is smaller.
+            media_kind = MediaKind.DOCUMENT
         try:
-            return await self._send_as(request.media_kind, request, file_path, content_type)
+            return await self._send_as(media_kind, request, file_path, content_type)
         except TelegramAPIError as exc:
             if (
                 request.fallback_to_document
-                and request.media_kind is not MediaKind.DOCUMENT
+                and media_kind is not MediaKind.DOCUMENT
                 and not exc.retryable
                 and self._is_media_format_error(str(exc))
             ):
@@ -187,5 +198,6 @@ class TelegramBotAPIClient:
             "photo_invalid",
             "video_content_type_invalid",
             "file is too big for",
+            "is too big for a photo",
         )
         return any(marker in lowered for marker in markers)
